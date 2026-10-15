@@ -19,11 +19,29 @@ const promotionRoutes = require('./routes/promotion');
 
 
 // 3. Global Middleware
-app.use(cors({
-    origin:    'http://localhost:5173', //'https://sms-alpha-umber.vercel.app',// Make sure this is YOUR actual Vercel URL//
-    credentials: true
-})); 
+// Allowed frontend origins
+const allowedOrigins = new Set([
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    ...(process.env.FRONTEND_URLS || '')
+        .split(',')
+        .map(url => url.trim())
+        .filter(Boolean)
+]);
 
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests without an Origin header, such as server-side
+        // requests and some development tools.
+        if (!origin || allowedOrigins.has(origin)) {
+            return callback(null, true);
+        }
+
+        // Do not grant cross-origin access to unapproved websites.
+        return callback(null, false);
+    },
+    credentials: true
+}));
 
 // --- ADD THESE TWO LINES HERE ---
 app.use(express.json({

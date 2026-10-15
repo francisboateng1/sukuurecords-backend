@@ -3,8 +3,17 @@ const db = require('../db');
 const router = express.Router();
 const verifyToken = require('../middleware/authMiddleware');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const { v2: cloudinary } = require('cloudinary');
+
+// Configure Cloudinary using environment variables
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+
+
 
 // ======================================================
 // GET SCHOOL SETTINGS
@@ -335,48 +344,21 @@ console.log('DATABASE AFTER UPDATE:', verifySettings);
 // MULTER UPLOAD CONFIGURATION
 // ======================================================
 
-const uploadDir = path.join(__dirname, '../uploads');
-
-// Make sure uploads folder exists
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, {
-        recursive: true
-    });
-}
-
-const storage = multer.diskStorage({
-
-    destination: (req, file, cb) => {
-        cb(null, uploadDir);
-    },
-
-    filename: (req, file, cb) => {
-
-        const schoolId = req.user.school_id;
-
-        const extension = path.extname(file.originalname);
-
-        cb(
-            null,
-            `${schoolId}_logo${extension}`
-        );
-    }
-});
-
+// Keep uploaded files in memory temporarily.
+// Cloudinary will store the permanent image.
+const storage = multer.memoryStorage();
 
 // ======================================================
 // ONLY ALLOW IMAGE FILES
 // ======================================================
 
 const fileFilter = (req, file, cb) => {
-
     if (file.mimetype.startsWith('image/')) {
         cb(null, true);
     } else {
         cb(new Error('Only image files are allowed'), false);
     }
 };
-
 
 const upload = multer({
     storage,
@@ -387,8 +369,11 @@ const upload = multer({
 });
 
 
+
+
+
 // ======================================================
-// UPLOAD SCHOOL LOGO
+// UPLOAD SCHOOL LOGO TO CLOUDINARY
 // ======================================================
 
 router.post(
@@ -396,20 +381,57 @@ router.post(
     verifyToken,
     upload.single('logo'),
     async (req, res) => {
-
         try {
-
             const schoolId = req.user.school_id;
 
-            if (!req.file) {
+            if (!schoolId) {
                 return res.status(400).json({
-                    message: 'No logo file was uploaded'
+                    message: 'School information is missing.'
                 });
             }
 
-            const logoUrl = `/uploads/${req.file.filename}`;
+            if (!req.file) {
+                return res.status(400).json({
+                    message: 'No logo file was uploaded.'
+                });
+            }
 
-            // Check whether settings already exist
+            // Upload the image to Cloudinary.
+            // Each school gets its own logo identifier.
+            const cloudinaryResult = await new Promise(
+                (resolve, reject) => {
+                    const stream = cloudinary.uploader.upload_stream(
+                        {
+                            folder: 'sukuurecords/school-logos',
+                            public_id: `school_${schoolId}_logo`,
+                            overwrite: true,
+                            resource_type: 'image'
+                        },
+                        (error, result) => {
+                            if (error) {
+                                return reject(error);
+                            }
+
+                            if (!result || !result.secure_url) {
+                                return reject(
+                                    new Error(
+                                        'Cloudinary did not return a secure image URL.'
+                                    )
+                                );
+                            }
+
+                            resolve(result);
+                        }
+                    );
+
+                    stream.end(req.file.buffer);
+                }
+            );
+
+            // Store the permanent HTTPS image URL.
+            const logoUrl = cloudinaryResult.secure_url;
+
+            // Check whether settings already exist.
             const [existing] = await db.query(
                 `SELECT id
                  FROM school_settings
@@ -419,17 +441,14 @@ router.post(
             );
 
             if (existing.length > 0) {
-
                 await db.query(
                     `UPDATE school_settings
                      SET logo_url = ?
                      WHERE school_id = ?`,
                     [logoUrl, schoolId]
                 );
-
             } else {
-
-                // Get school name as default
+                // Get the school's name for the initial settings record.
                 const [school] = await db.query(
                     `SELECT school_name
                      FROM schools
@@ -459,17 +478,19 @@ router.post(
                 );
             }
 
-            res.json({
-                message: 'Logo updated successfully',
+            return res.json({
+                message: 'Logo uploaded and updated successfully.',
                 logoUrl
             });
 
         } catch (error) {
+            console.error(
+                'Logo upload error:',
+                error.message
+            );
 
-            console.error('Logo upload error:', error);
-
-            res.status(500).json({
-                message: 'Failed to update logo'
+            return res.status(500).json({
+                message: 'Failed to upload or update the school logo.'
             });
         }
     }
