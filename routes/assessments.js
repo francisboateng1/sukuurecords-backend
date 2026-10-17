@@ -1,5 +1,6 @@
 const express = require('express');
-const db = require('../db'); 
+const db = require('../db');
+const adminMiddleware = require('../middleware/adminMiddleware');
 const router = express.Router();
 
 // 1. The missing POST route to save marks
@@ -59,6 +60,577 @@ router.get('/leaderboard/:className', async (req, res) => {
 router.get('/test', (req, res) => {
     res.json({ message: "Assessment route is working!" });
 });
+
+
+
+
+
+
+// =====================================================
+// ADMIN: GET ALL CLASSES FOR THE SCHOOL
+// =====================================================
+
+router.get(
+    '/admin/classes',
+    authenticateTeacher,
+    adminMiddleware,
+    async (req, res) => {
+        try {
+            const schoolId = req.user.school_id;
+
+            const [classes] = await db.query(
+                `
+                SELECT
+                    id,
+                    class_name
+                FROM school_classes
+                WHERE school_id = ?
+                ORDER BY class_name ASC
+                `,
+                [schoolId]
+            );
+
+            return res.json(classes);
+
+        } catch (error) {
+            console.error(
+                'Admin: error loading classes:',
+                error
+            );
+
+            return res.status(500).json({
+                message: 'Failed to load school classes.'
+            });
+        }
+    }
+);
+
+
+
+
+// =====================================================
+// ADMIN: GET ALL SUBJECTS FOR THE SCHOOL
+// =====================================================
+
+router.get(
+    '/admin/subjects',
+    authenticateTeacher,
+    adminMiddleware,
+    async (req, res) => {
+        try {
+            const schoolId = req.user.school_id;
+
+            const [subjects] = await db.query(
+                `
+                SELECT
+                    id,
+                    subject_name
+                FROM school_subjects
+                WHERE school_id = ?
+                ORDER BY subject_name ASC
+                `,
+                [schoolId]
+            );
+
+            return res.json(subjects);
+
+        } catch (error) {
+            console.error(
+                'Admin: error loading subjects:',
+                error
+            );
+
+            return res.status(500).json({
+                message: 'Failed to load school subjects.'
+            });
+        }
+    }
+);
+
+
+
+
+
+
+
+
+
+
+
+
+
+// =====================================================
+// ADMIN: LOAD STUDENTS AND EXISTING MARKS
+// =====================================================
+
+router.get(
+    '/admin/bulk-marks',
+    authenticateTeacher,
+    adminMiddleware,
+    async (req, res) => {
+        try {
+            const schoolId = req.user.school_id;
+            const { class_id, subject_id } = req.query;
+
+            if (!class_id || !subject_id) {
+                return res.status(400).json({
+                    message: 'Class and subject are required.'
+                });
+            }
+
+            const [settings] = await db.query(
+                `SELECT current_term, academic_year
+                 FROM school_settings
+                 WHERE school_id = ?
+                 LIMIT 1`,
+                [schoolId]
+            );
+
+            if (
+                !settings.length ||
+                !settings[0].current_term ||
+                !settings[0].academic_year
+            ) {
+                return res.status(400).json({
+                    message:
+                        'Configure the current term and academic year in school settings first.'
+                });
+            }
+
+            const currentTerm = settings[0].current_term;
+            const academicYear = settings[0].academic_year;
+
+            const [classes] = await db.query(
+                `SELECT id, class_name
+                 FROM school_classes
+                 WHERE id = ?
+                 AND school_id = ?
+                 LIMIT 1`,
+                [class_id, schoolId]
+            );
+
+            if (!classes.length) {
+                return res.status(404).json({
+                    message: 'Class not found in your school.'
+                });
+            }
+
+            const [subjects] = await db.query(
+                `SELECT id, subject_name
+                 FROM school_subjects
+                 WHERE id = ?
+                 AND school_id = ?
+                 LIMIT 1`,
+                [subject_id, schoolId]
+            );
+
+            if (!subjects.length) {
+                return res.status(404).json({
+                    message: 'Subject not found in your school.'
+                });
+            }
+
+            const className = classes[0].class_name;
+            const subjectName = subjects[0].subject_name;
+
+            const [students] = await db.query(
+                `SELECT
+                    st.id AS student_id,
+                    st.full_name,
+                    st.current_class,
+                    a.id AS assessment_id,
+                    a.teacher_id,
+                    a.class_score,
+                    a.exam_score,
+                    a.total_score
+                 FROM students st
+                 LEFT JOIN assessments a
+                    ON a.student_id = st.id
+                    AND a.subject = ?
+                    AND a.term = ?
+                    AND a.academic_year = ?
+                 WHERE st.school_id = ?
+                 AND st.current_class = ?
+                 ORDER BY st.full_name ASC`,
+                [
+                    subjectName,
+                    currentTerm,
+                    academicYear,
+                    schoolId,
+                    className
+                ]
+            );
+
+            // A duplicated assessment should never be silently
+            // selected for editing.
+            const seenStudents = new Set();
+
+            for (const student of students) {
+                if (seenStudents.has(student.student_id)) {
+                    return res.status(409).json({
+                        message:
+                            'Duplicate assessment records were found. Resolve the duplicates before editing these marks.'
+                    });
+                }
+
+                seenStudents.add(student.student_id);
+            }
+
+            return res.json({
+                class_id: Number(class_id),
+                class_name: className,
+                subject_id: Number(subject_id),
+                subject_name: subjectName,
+                term: currentTerm,
+                academic_year: academicYear,
+                students
+            });
+
+        } catch (error) {
+            console.error(
+                'Admin: error loading bulk marks:',
+                error
+            );
+
+            return res.status(500).json({
+                message: 'Failed to load students and marks.'
+            });
+        }
+    }
+);
+
+
+
+
+
+
+// =====================================================
+// ADMIN: CREATE OR UPDATE BULK MARKS
+// =====================================================
+
+router.post(
+    '/admin/bulk-marks',
+    authenticateTeacher,
+    adminMiddleware,
+    async (req, res) => {
+        const schoolId = req.user.school_id;
+        const adminId = req.user.id;
+
+        const {
+            class_id,
+            subject_id,
+            marks
+        } = req.body;
+
+       // Validate each submitted entry before accessing its properties.
+if (
+    marks.some(
+        mark =>
+            !mark ||
+            typeof mark !== 'object' ||
+            Array.isArray(mark)
+    )
+) {
+    return res.status(400).json({
+        message: 'Every marks entry must be a valid object.'
+    });
+}
+
+// Reject repeated student IDs in the same submitted batch.
+const submittedIds = marks.map(
+    mark => Number(mark.student_id)
+);
+
+if (
+    submittedIds.some(
+        id => !Number.isInteger(id) || id <= 0
+    ) ||
+    new Set(submittedIds).size !== submittedIds.length
+) {
+    return res.status(400).json({
+        message:
+            'Every student must have a valid, unique student ID.'
+    });
+}
+
+
+
+        // Validate scores before starting the database transaction.
+        for (const mark of marks) {
+            const classScore = Number(mark.class_score);
+            const examScore = Number(mark.exam_score);
+
+            if (
+                mark.class_score === '' ||
+                mark.exam_score === '' ||
+                mark.class_score === null ||
+                mark.exam_score === null ||
+                !Number.isFinite(classScore) ||
+                !Number.isFinite(examScore) ||
+                classScore < 0 ||
+                classScore > 30 ||
+                examScore < 0 ||
+                examScore > 70
+            ) {
+                return res.status(400).json({
+                    message:
+                        'Class scores must be 0–30 and exam scores must be 0–70.',
+                    student_id: mark.student_id
+                });
+            }
+        }
+
+        let connection;
+
+        try {
+            connection = await db.getConnection();
+
+            await connection.beginTransaction();
+
+            // Confirm the class belongs to this school.
+            const [classes] = await connection.execute(
+                `SELECT id, class_name
+                 FROM school_classes
+                 WHERE id = ?
+                 AND school_id = ?
+                 LIMIT 1`,
+                [class_id, schoolId]
+            );
+
+            if (!classes.length) {
+                await connection.rollback();
+
+                return res.status(404).json({
+                    message: 'Class not found in your school.'
+                });
+            }
+
+            // Confirm the subject belongs to this school.
+            const [subjects] = await connection.execute(
+                `SELECT id, subject_name
+                 FROM school_subjects
+                 WHERE id = ?
+                 AND school_id = ?
+                 LIMIT 1`,
+                [subject_id, schoolId]
+            );
+
+            if (!subjects.length) {
+                await connection.rollback();
+
+                return res.status(404).json({
+                    message: 'Subject not found in your school.'
+                });
+            }
+
+            // Use the school's configured term and year.
+            const [settings] = await connection.execute(
+                `SELECT current_term, academic_year
+                 FROM school_settings
+                 WHERE school_id = ?
+                 LIMIT 1`,
+                [schoolId]
+            );
+
+            if (
+                !settings.length ||
+                !settings[0].current_term ||
+                !settings[0].academic_year
+            ) {
+                await connection.rollback();
+
+                return res.status(400).json({
+                    message:
+                        'Configure the current term and academic year first.'
+                });
+            }
+
+            const currentTerm = settings[0].current_term;
+            const academicYear = settings[0].academic_year;
+            const className = classes[0].class_name;
+            const subjectName = subjects[0].subject_name;
+
+            let createdCount = 0;
+            let updatedCount = 0;
+
+            for (const mark of marks) {
+                const studentId = Number(mark.student_id);
+                const classScore = Number(mark.class_score);
+                const examScore = Number(mark.exam_score);
+
+                // Ensure the student belongs to the selected class
+                // and the administrator's school.
+                const [students] = await connection.execute(
+                    `SELECT id
+                     FROM students
+                     WHERE id = ?
+                     AND school_id = ?
+                     AND current_class = ?
+                     LIMIT 1`,
+                    [
+                        studentId,
+                        schoolId,
+                        className
+                    ]
+                );
+
+                if (!students.length) {
+                    throw new Error(
+                        `Student ${studentId} does not belong to the selected class and school.`
+                    );
+                }
+
+                // Find existing marks regardless of which teacher
+                // originally entered them.
+                const [existing] = await connection.execute(
+                    `SELECT id, teacher_id
+                     FROM assessments
+                     WHERE student_id = ?
+                     AND subject = ?
+                     AND term = ?
+                     AND academic_year = ?
+                     FOR UPDATE`,
+                    [
+                        studentId,
+                        subjectName,
+                        currentTerm,
+                        academicYear
+                    ]
+                );
+
+               if (existing.length > 1) {
+    const error = new Error(
+        `Student ${studentId} has duplicate assessment records.`
+    );
+
+    error.code = 'DUPLICATE_ASSESSMENT';
+
+    throw error;
+}
+
+                const totalScore = classScore + examScore;
+
+                if (existing.length === 1) {
+                    // Preserve the existing teacher_id.
+                    await connection.execute(
+                        `UPDATE assessments
+                         SET class_score = ?,
+                             exam_score = ?,
+                             total_score = ?
+                         WHERE id = ?`,
+                        [
+                            classScore,
+                            examScore,
+                            totalScore,
+                            existing[0].id
+                        ]
+                    );
+
+                    updatedCount++;
+                } else {
+                    // New marks are attributed to the administrator
+                    // who created them.
+                    await connection.execute(
+                        `INSERT INTO assessments (
+                            student_id,
+                            teacher_id,
+                            subject,
+                            class_score,
+                            exam_score,
+                            total_score,
+                            term,
+                            academic_year
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                            studentId,
+                            adminId,
+                            subjectName,
+                            classScore,
+                            examScore,
+                            totalScore,
+                            currentTerm,
+                            academicYear
+                        ]
+                    );
+
+                    createdCount++;
+                }
+            }
+
+            await connection.commit();
+
+            return res.status(200).json({
+                message: 'Bulk marks saved successfully.',
+                created_count: createdCount,
+                updated_count: updatedCount,
+                term: currentTerm,
+                academic_year: academicYear
+            });
+
+       } catch (error) {
+    if (connection) {
+        try {
+            await connection.rollback();
+        } catch (rollbackError) {
+            console.error(
+                'Admin marks rollback failed:',
+                rollbackError
+            );
+        }
+    }
+
+    // Keep technical details in server logs, not API responses.
+    console.error(
+        'Admin bulk marks save error:',
+        error
+    );
+
+    // Duplicate assessment records require conflict resolution.
+    if (error.code === 'DUPLICATE_ASSESSMENT') {
+        return res.status(409).json({
+            message:
+                'Duplicate assessment records were found. Resolve the duplicates before saving marks.'
+        });
+    }
+
+    // Invalid student/class combinations are client-side conflicts.
+    if (
+        error.message &&
+        error.message.includes(
+            'does not belong to the selected class and school'
+        )
+    ) {
+        return res.status(400).json({
+            message:
+                'One or more students do not belong to the selected class and school.'
+        });
+    }
+
+    return res.status(500).json({
+        message:
+            'Bulk marks could not be saved. Please try again or contact support.'
+    });
+}
+ finally {
+            if (connection) {
+                connection.release();
+            }
+        }
+    }
+);
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
