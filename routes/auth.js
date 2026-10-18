@@ -5,37 +5,169 @@ const db = require('../db');
 const router = express.Router();
 
 router.post('/register', async (req, res) => {
-    console.log("Register route reached");
     const { school_name, admin_name, email, password } = req.body;
 
+    // Validate required fields
+    if (
+        !school_name?.trim() ||
+        !admin_name?.trim() ||
+        !email?.trim() ||
+        !password
+    ) {
+        return res.status(400).json({
+            message: 'School name, administrator name, email, and password are required.'
+        });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Hash the password before opening the transaction
+    let hashedPassword;
+
     try {
-        // 1. Check if email already exists
-        const [existingUsers] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
+        const salt = await bcrypt.genSalt(10);
+        hashedPassword = await bcrypt.hash(password, salt);
+    } catch (error) {
+        console.error('Password hashing error:', error);
+
+        return res.status(500).json({
+            message: 'Unable to process registration.'
+        });
+    }
+
+    let connection;
+    let transactionStarted = false;
+
+    try {
+        connection = await db.getConnection();
+
+        await connection.beginTransaction();
+        transactionStarted = true;
+
+        // 1. Check whether the administrator email already exists
+        const [existingUsers] = await connection.query(
+            'SELECT id FROM users WHERE email = ? LIMIT 1',
+            [normalizedEmail]
+        );
+
         if (existingUsers.length > 0) {
-            return res.status(400).json({ message: "Email already in use." });
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(400).json({
+                message: 'Email already in use.'
+            });
         }
 
-        // 2. Insert the new School
-        const [schoolResult] = await db.query(
-            'INSERT INTO schools (school_name, sub_status) VALUES (?, ?)', 
-            [school_name, 'trial']
-        );
-        const schoolId = schoolResult.insertId; // Get the generated ID
-
-        // 3. Hash the password and insert the Admin User
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-
-        await db.query(
-            'INSERT INTO users (school_id, full_name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)',
-            [schoolId, admin_name, email, hashedPassword, 'admin']
+        // 2. Lock the counter so simultaneous registrations
+        // cannot receive the same school code.
+        const [counterRows] = await connection.query(
+            `SELECT last_code
+             FROM school_admission_code_counter
+             WHERE counter_name = ?
+             FOR UPDATE`,
+            ['global']
         );
 
-        res.status(201).json({ message: "School and Admin registered successfully!" });
+        if (counterRows.length === 0) {
+            throw new Error(
+                'School admission-code counter is missing. Registration cannot continue.'
+            );
+        }
+
+        const nextCode = Number(counterRows[0].last_code) + 1;
+
+        if (nextCode > 9999) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(409).json({
+                message: 'The school-code limit has been reached. Contact the system administrator.'
+            });
+        }
+
+        const admissionCode = String(nextCode).padStart(4, '0');
+
+        // 3. Advance the counter inside the transaction
+        await connection.query(
+            `UPDATE school_admission_code_counter
+             SET last_code = ?
+             WHERE counter_name = ?`,
+            [nextCode, 'global']
+        );
+
+        // 4. Create the school with its permanent admission code
+        const [schoolResult] = await connection.query(
+            `INSERT INTO schools
+                (school_name, sub_status, admission_code)
+             VALUES (?, ?, ?)`,
+            [
+                school_name.trim(),
+                'trial',
+                admissionCode
+            ]
+        );
+
+        const schoolId = schoolResult.insertId;
+
+        // 5. Create the administrator account
+        await connection.query(
+            `INSERT INTO users
+                (school_id, full_name, email, password_hash, role)
+             VALUES (?, ?, ?, ?, ?)`,
+            [
+                schoolId,
+                admin_name.trim(),
+                normalizedEmail,
+                hashedPassword,
+                'admin'
+            ]
+        );
+
+        // 6. Commit the school, counter, and admin together
+        await connection.commit();
+        transactionStarted = false;
+
+        return res.status(201).json({
+            message: 'School and administrator registered successfully!',
+            school: {
+                id: schoolId,
+                name: school_name.trim(),
+                admission_code: admissionCode
+            }
+        });
 
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Server error during registration." });
+        if (connection && transactionStarted) {
+            try {
+                await connection.rollback();
+            } catch (rollbackError) {
+                console.error(
+                    'Registration rollback error:',
+                    rollbackError
+                );
+            }
+        }
+
+        console.error('School registration error:', error);
+
+        // Handle a duplicate email if another request registered
+        // the same email concurrently and the database has a
+        // unique constraint on users.email.
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({
+                message: 'This email or school admission code is already in use. Please retry or use another email.'
+            });
+        }
+
+        return res.status(500).json({
+            message: 'Server error during registration.'
+        });
+
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 });
 
