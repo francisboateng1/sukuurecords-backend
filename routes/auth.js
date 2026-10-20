@@ -3,23 +3,121 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const router = express.Router();
+const crypto = require('crypto');
+
+
+const {
+    TERMS_VERSION,
+    SERVICE_VERSION,
+    TERMS_TEXT,
+    SERVICE_TEXT,
+    hashText
+} = require('../utils/agreementDocuments');
+
+
+
+
+
+
+
+
+// Return the authoritative agreement documents shown during registration.
+router.get('/agreements', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+
+    return res.status(200).json({
+        documents: {
+            terms: {
+                version: TERMS_VERSION,
+                text: TERMS_TEXT,
+                hash: hashText(TERMS_TEXT)
+            },
+            service_agreement: {
+                version: SERVICE_VERSION,
+                text: SERVICE_TEXT,
+                hash: hashText(SERVICE_TEXT)
+            }
+        }
+    });
+});
+
+
+
+
+
 
 router.post('/register', async (req, res) => {
-    const { school_name, admin_name, email, password } = req.body;
+    const {
+    school_name,
+    admin_name,
+    email,
+    password,
+    invitation_code,
+    signature_name,
+    terms_accepted,
+    service_agreement_accepted,
+    authority_confirmed,
+    terms_version,
+    terms_hash,
+    service_agreement_version,
+    service_agreement_hash
+} = req.body;
 
-    // Validate required fields
+    // 1. Validate required fields
     if (
-        !school_name?.trim() ||
-        !admin_name?.trim() ||
-        !email?.trim() ||
-        !password
+        typeof school_name !== 'string' ||
+        !school_name.trim() ||
+        typeof admin_name !== 'string' ||
+        !admin_name.trim() ||
+        typeof email !== 'string' ||
+        !email.trim() ||
+        typeof password !== 'string' ||
+        !password ||
+        typeof invitation_code !== 'string' ||
+        !invitation_code.trim()
     ) {
         return res.status(400).json({
-            message: 'School name, administrator name, email, and password are required.'
+            message: 'School name, administrator name, email, password, and invitation code are required.'
         });
     }
+    // Validate agreement acceptance and electronic signature.
+if (
+    typeof signature_name !== 'string' ||
+    !signature_name.trim() ||
+    terms_accepted !== true ||
+    service_agreement_accepted !== true ||
+    authority_confirmed !== true
+) {
+    return res.status(400).json({
+        message:
+            'You must accept both documents, provide your full name as your electronic signature, and confirm your authority to represent the school.'
+    });
+}
+// Require acceptance of the exact current agreement versions.
+if (
+    terms_version !== TERMS_VERSION ||
+    terms_hash !== hashText(TERMS_TEXT) ||
+    service_agreement_version !== SERVICE_VERSION ||
+    service_agreement_hash !== hashText(SERVICE_TEXT)
+) {
+    return res.status(409).json({
+        message:
+            'The agreement documents have changed or could not be verified. Reload the registration page, review the current documents, and accept them again.'
+    });
+}
 
+
+const normalizedSignatureName = signature_name.trim();
+
+    const normalizedSchoolName = school_name.trim();
+    const normalizedAdminName = admin_name.trim();
     const normalizedEmail = email.trim().toLowerCase();
+
+    // 2. Hash the invitation code for database lookup
+    const codeHash = crypto
+        .createHash('sha256')
+        .update(invitation_code.trim())
+        .digest('hex');
 
     // Hash the password before opening the transaction
     let hashedPassword;
@@ -44,7 +142,66 @@ router.post('/register', async (req, res) => {
         await connection.beginTransaction();
         transactionStarted = true;
 
-        // 1. Check whether the administrator email already exists
+        // 3. Lock the invitation row to prevent concurrent reuse
+        const [invitationRows] = await connection.query(
+            `SELECT
+                id,
+                intended_school_name,
+                expires_at,
+                used_at,
+                (expires_at <= UTC_TIMESTAMP()) AS is_expired
+             FROM school_registration_invitations
+             WHERE code_hash = ?
+             LIMIT 1
+             FOR UPDATE`,
+            [codeHash]
+        );
+
+        if (invitationRows.length === 0) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(403).json({
+                message: 'Invalid invitation code.'
+            });
+        }
+
+        const invitation = invitationRows[0];
+
+        if (invitation.used_at !== null) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(403).json({
+                message: 'This invitation has already been used.'
+            });
+        }
+
+        if (Number(invitation.is_expired) === 1) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(403).json({
+                message: 'This invitation has expired. Contact the system administrator.'
+            });
+        }
+
+        // 4. Ensure the invitation belongs to this school
+        const intendedSchoolName =
+            String(invitation.intended_school_name).trim().toLowerCase();
+
+        if (
+            normalizedSchoolName.toLowerCase() !== intendedSchoolName
+        ) {
+            await connection.rollback();
+            transactionStarted = false;
+
+            return res.status(403).json({
+                message: 'This invitation is not assigned to the supplied school name.'
+            });
+        }
+
+        // 5. Check whether the administrator email already exists
         const [existingUsers] = await connection.query(
             'SELECT id FROM users WHERE email = ? LIMIT 1',
             [normalizedEmail]
@@ -59,8 +216,8 @@ router.post('/register', async (req, res) => {
             });
         }
 
-        // 2. Lock the counter so simultaneous registrations
-        // cannot receive the same school code.
+        // 6. Lock the counter so simultaneous registrations
+        // cannot receive the same school admission code
         const [counterRows] = await connection.query(
             `SELECT last_code
              FROM school_admission_code_counter
@@ -71,7 +228,7 @@ router.post('/register', async (req, res) => {
 
         if (counterRows.length === 0) {
             throw new Error(
-                'School admission-code counter is missing. Registration cannot continue.'
+                'School admission-code counter is missing.'
             );
         }
 
@@ -88,7 +245,7 @@ router.post('/register', async (req, res) => {
 
         const admissionCode = String(nextCode).padStart(4, '0');
 
-        // 3. Advance the counter inside the transaction
+        // 7. Advance the counter inside the transaction
         await connection.query(
             `UPDATE school_admission_code_counter
              SET last_code = ?
@@ -96,13 +253,13 @@ router.post('/register', async (req, res) => {
             [nextCode, 'global']
         );
 
-        // 4. Create the school with its permanent admission code
+        // 8. Create the school
         const [schoolResult] = await connection.query(
             `INSERT INTO schools
                 (school_name, sub_status, admission_code)
              VALUES (?, ?, ?)`,
             [
-                school_name.trim(),
+                normalizedSchoolName,
                 'trial',
                 admissionCode
             ]
@@ -110,32 +267,108 @@ router.post('/register', async (req, res) => {
 
         const schoolId = schoolResult.insertId;
 
-        // 5. Create the administrator account
-        await connection.query(
-            `INSERT INTO users
-                (school_id, full_name, email, password_hash, role)
-             VALUES (?, ?, ?, ?, ?)`,
-            [
-                schoolId,
-                admin_name.trim(),
-                normalizedEmail,
-                hashedPassword,
-                'admin'
-            ]
+        // 9. Create the administrator account
+       const [adminResult] = await connection.query(
+    `INSERT INTO users
+        (school_id, full_name, email, password_hash, role)
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+        schoolId,
+        normalizedAdminName,
+        normalizedEmail,
+        hashedPassword,
+        'admin'
+    ]
+);
+
+const adminId = adminResult.insertId;
+
+
+// Preserve a separate acceptance record for each document.
+// These inserts run inside the existing registration transaction.
+const acceptedDocuments = [
+    {
+        version: TERMS_VERSION,
+        text: TERMS_TEXT
+    },
+    {
+        version: SERVICE_VERSION,
+        text: SERVICE_TEXT
+    }
+];
+
+for (const document of acceptedDocuments) {
+    await connection.query(
+        `INSERT INTO service_agreement_acceptances (
+            school_id,
+            user_id,
+            signatory_full_name,
+            agreement_version,
+            agreement_text,
+            agreement_hash,
+            terms_accepted,
+            authority_confirmed,
+            accepted_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())`,
+        [
+            schoolId,
+            adminId,
+            normalizedSignatureName,
+            document.version,
+            document.text,
+            hashText(document.text),
+            true,
+            true
+        ]
+    );
+}
+
+
+
+
+
+        // 10. Mark the invitation as used.
+        // This happens inside the same transaction as registration.
+        const [usedResult] = await connection.query(
+            `UPDATE school_registration_invitations
+             SET used_at = UTC_TIMESTAMP()
+             WHERE id = ?
+               AND used_at IS NULL
+               AND expires_at > UTC_TIMESTAMP()`,
+            [invitation.id]
         );
 
-        // 6. Commit the school, counter, and admin together
+        if (usedResult.affectedRows !== 1) {
+            throw new Error(
+                'Invitation could not be consumed safely.'
+            );
+        }
+
+        // 11. Commit everything together
         await connection.commit();
         transactionStarted = false;
 
-        return res.status(201).json({
-            message: 'School and administrator registered successfully!',
-            school: {
-                id: schoolId,
-                name: school_name.trim(),
-                admission_code: admissionCode
-            }
-        });
+       return res.status(201).json({
+    message: 'School and administrator registered successfully!',
+    school: {
+        id: schoolId,
+        name: normalizedSchoolName,
+        admission_code: admissionCode
+    },
+    administrator: {
+        id: adminId,
+        name: normalizedAdminName,
+        email: normalizedEmail
+    },
+    agreement_acceptance: {
+        recorded: true,
+        documents: [
+            TERMS_VERSION,
+            SERVICE_VERSION
+        ]
+    }
+});
 
     } catch (error) {
         if (connection && transactionStarted) {
@@ -151,9 +384,6 @@ router.post('/register', async (req, res) => {
 
         console.error('School registration error:', error);
 
-        // Handle a duplicate email if another request registered
-        // the same email concurrently and the database has a
-        // unique constraint on users.email.
         if (error.code === 'ER_DUP_ENTRY') {
             return res.status(409).json({
                 message: 'This email or school admission code is already in use. Please retry or use another email.'
@@ -170,7 +400,6 @@ router.post('/register', async (req, res) => {
         }
     }
 });
-
 
 // --- LOGIN ENDPOINT ---
 // --- LOGIN ENDPOINT ---
@@ -1048,5 +1277,307 @@ router.delete('/subjects/:id', async (req, res) => {
         });
     }
 });
+
+
+
+
+
+// SYSTEM OWNER AUTHENTICATION MIDDLEWARE
+async function requireSystemOwner(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: 'System Owner authentication required.'
+            });
+        }
+
+        const token = authHeader.split(' ')[1];
+
+        if (!process.env.JWT_SECRET) {
+            return res.status(500).json({
+                message: 'Authentication is not configured.'
+            });
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        if (
+            decoded.type !== 'system_owner' ||
+            decoded.role !== 'system_owner' ||
+            !decoded.id
+        ) {
+            return res.status(403).json({
+                message: 'Access denied. System Owner privileges required.'
+            });
+        }
+
+        const [owners] = await db.execute(
+            `SELECT id
+             FROM system_owners
+             WHERE id = ? AND is_active = TRUE
+             LIMIT 1`,
+            [decoded.id]
+        );
+
+        if (owners.length === 0) {
+            return res.status(403).json({
+                message: 'System Owner account is inactive or unavailable.'
+            });
+        }
+
+        req.systemOwner = {
+            id: owners[0].id
+        };
+
+        next();
+
+    } catch (error) {
+        if (
+            error.name === 'JsonWebTokenError' ||
+            error.name === 'TokenExpiredError'
+        ) {
+            return res.status(401).json({
+                message: 'Invalid or expired authentication token.'
+            });
+        }
+
+        console.error('System Owner authentication error:', error);
+
+        return res.status(500).json({
+            message: 'Authentication failed.'
+        });
+    }
+}
+
+
+
+
+
+// SYSTEM OWNER LOGIN
+router.post('/owner/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({
+                message: 'Email and password are required.'
+            });
+        }
+
+        const normalizedEmail = email.trim().toLowerCase();
+
+        const [owners] = await db.execute(
+            `SELECT id, full_name, email, password_hash, is_active
+             FROM system_owners
+             WHERE email = ?
+             LIMIT 1`,
+            [normalizedEmail]
+        );
+
+        if (owners.length === 0) {
+            return res.status(401).json({
+                message: 'Invalid email or password.'
+            });
+        }
+
+        const owner = owners[0];
+
+        if (!owner.is_active) {
+            return res.status(403).json({
+                message: 'This System Owner account is inactive.'
+            });
+        }
+
+        const passwordMatches = await bcrypt.compare(
+            password,
+            owner.password_hash
+        );
+
+        if (!passwordMatches) {
+            return res.status(401).json({
+                message: 'Invalid email or password.'
+            });
+        }
+
+        if (!process.env.JWT_SECRET) {
+            console.error('JWT_SECRET is not configured.');
+
+            return res.status(500).json({
+                message: 'Authentication is not configured.'
+            });
+        }
+
+        const token = jwt.sign(
+            {
+                id: owner.id,
+                role: 'system_owner',
+                type: 'system_owner'
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: '2h' }
+        );
+
+        return res.status(200).json({
+            message: 'System Owner login successful.',
+            token,
+            owner: {
+                id: owner.id,
+                full_name: owner.full_name,
+                email: owner.email
+            }
+        });
+
+    } catch (error) {
+        console.error('System Owner login error:', error);
+
+        return res.status(500).json({
+            message: 'An error occurred during login.'
+        });
+    }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ==========================================
+// SYSTEM OWNER: GENERATE SCHOOL INVITATION
+// ==========================================
+router.post(
+    '/owner/invitations',
+    requireSystemOwner,
+    async (req, res) => {
+        try {
+            const { intended_school_name, expires_in_hours = 168 } = req.body;
+
+            if (
+                typeof intended_school_name !== 'string' ||
+                !intended_school_name.trim()
+            ) {
+                return res.status(400).json({
+                    message: 'School name is required.'
+                });
+            }
+
+            const schoolName = intended_school_name.trim();
+
+            if (schoolName.length > 255) {
+                return res.status(400).json({
+                    message: 'School name cannot exceed 255 characters.'
+                });
+            }
+
+            const hours = Number(expires_in_hours);
+
+            if (
+                !Number.isInteger(hours) ||
+                hours < 1 ||
+                hours > 720
+            ) {
+                return res.status(400).json({
+                    message: 'Expiration must be between 1 and 720 hours.'
+                });
+            }
+
+            // Generate a cryptographically secure, unpredictable code.
+            const invitationCode = crypto
+                .randomBytes(32)
+                .toString('hex');
+
+            // Store only the SHA-256 hash, never the original code.
+            const codeHash = crypto
+                .createHash('sha256')
+                .update(invitationCode)
+                .digest('hex');
+
+            // Store expiration as a UTC datetime.
+            const expiresAt = new Date(
+                Date.now() + hours * 60 * 60 * 1000
+            )
+                .toISOString()
+                .slice(0, 19)
+                .replace('T', ' ');
+
+            await db.execute(
+                `INSERT INTO school_registration_invitations
+                    (code_hash, intended_school_name, expires_at)
+                 VALUES (?, ?, ?)`,
+                [codeHash, schoolName, expiresAt]
+            );
+
+            return res.status(201).json({
+                message: 'School invitation created successfully.',
+                invitation: {
+                    code: invitationCode,
+                    intended_school_name: schoolName,
+                    expires_at_utc: expiresAt,
+                    expires_in_hours: hours
+                },
+                warning: 'Copy this code now. It cannot be retrieved later.'
+            });
+
+        } catch (error) {
+            console.error('Invitation creation error:', error);
+
+            return res.status(500).json({
+                message: 'Could not create the school invitation.'
+            });
+        }
+    }
+);
+
+
+// ==========================================
+// SYSTEM OWNER: VIEW INVITATION HISTORY
+// ==========================================
+router.get(
+    '/owner/invitations',
+    requireSystemOwner,
+    async (req, res) => {
+        try {
+            const [invitations] = await db.execute(
+                `SELECT
+                    id,
+                    intended_school_name,
+                    expires_at,
+                    used_at,
+                    created_at,
+                    CASE
+                        WHEN used_at IS NOT NULL THEN 'used'
+                        WHEN expires_at <= UTC_TIMESTAMP() THEN 'expired'
+                        ELSE 'unused'
+                    END AS status
+                 FROM school_registration_invitations
+                 ORDER BY created_at DESC
+                 LIMIT 200`
+            );
+
+            return res.status(200).json({
+                invitations
+            });
+
+        } catch (error) {
+            console.error('Invitation history error:', error);
+
+            return res.status(500).json({
+                message: 'Could not retrieve invitation history.'
+            });
+        }
+    }
+);
+
+
+
+
 
 module.exports = router;
